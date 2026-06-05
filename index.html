@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>SplitApp — Guest</title>
+<style>
+  :root { --bg:#0b0b0c; --card:#161618; --line:#262629; --fg:#f2f2f5; --sub:#9a9aa2; --pos:#34c759; --neg:#ff453a; --tint:#0a84ff; }
+  * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; }
+  .wrap { max-width:520px; margin:0 auto; padding:20px 16px 48px; }
+  h1 { font-size:24px; margin:4px 0 2px; }
+  .muted { color:var(--sub); font-size:14px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:14px; padding:14px 16px; margin:12px 0; }
+  .row { display:flex; justify-content:space-between; align-items:center; gap:12px; padding:8px 0; border-bottom:1px solid var(--line); }
+  .row:last-child { border-bottom:none; }
+  .row .name { font-weight:600; }
+  .row .sub { color:var(--sub); font-size:13px; }
+  .amt { font-variant-numeric:tabular-nums; font-weight:600; white-space:nowrap; }
+  .pos { color:var(--pos); } .neg { color:var(--neg); }
+  .section-title { color:var(--sub); font-size:13px; text-transform:uppercase; letter-spacing:.04em; margin:22px 4px 6px; }
+  .center { text-align:center; padding:48px 16px; }
+  .spinner { width:34px; height:34px; border:3px solid var(--line); border-top-color:var(--tint); border-radius:50%; animation:spin 0.9s linear infinite; margin:0 auto 14px; }
+  @keyframes spin { to { transform:rotate(360deg);} }
+  .err { color:var(--neg); }
+  .badge { display:inline-block; background:var(--tint); color:#fff; font-size:11px; font-weight:700; padding:2px 8px; border-radius:999px; vertical-align:middle; margin-left:8px; }
+  .pill { background:#0a84ff22; color:var(--tint); border-radius:8px; font-size:12px; padding:1px 7px; }
+</style>
+</head>
+<body>
+<div class="wrap" id="app">
+  <div class="center"><div class="spinner"></div><div class="muted">Loading your group…</div></div>
+</div>
+
+<script type="module">
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+
+const SUPABASE_URL = "https://pbzlebzfwnewulohgxwb.supabase.co";
+const PUBLISHABLE_KEY = "sb_publishable_ldjfeeLdF986WNi0xMu-Ng_BvssHOAx";
+
+const app = document.getElementById("app");
+const params = new URLSearchParams(location.search);
+const token = (params.get("token") || "").trim();
+
+const fmt = (cents, ccy="SGD") => {
+  const sign = cents < 0 ? "-" : "";
+  const v = (Math.abs(cents) / 100).toFixed(2);
+  return `${sign}${ccy === "SGD" ? "S$" : ccy + " "}${v}`;
+};
+const esc = (s) => String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const showError = (msg, detail) => {
+  app.innerHTML = `<div class="center"><h1>Couldn't open the group</h1>
+    <p class="err">${esc(msg)}</p>${detail ? `<p class="muted">${esc(detail)}</p>` : ""}
+    <p class="muted">Ask whoever invited you to resend the link.</p></div>`;
+};
+
+async function main() {
+  if (!token) return showError("This link is missing its invite code.");
+  const sb = createClient(SUPABASE_URL, PUBLISHABLE_KEY, {
+    auth: { persistSession: true, autoRefreshToken: true, storageKey: "splitapp-guest" }
+  });
+
+  // 1) Anonymous session (no signup) — reuse an existing one if present.
+  let { data: sess } = await sb.auth.getSession();
+  if (!sess?.session) {
+    const { error } = await sb.auth.signInAnonymously();
+    if (error) return showError("Couldn't start a guest session.", error.message);
+  }
+
+  // 2) Redeem the invite (best-effort — may already be redeemed by this guest).
+  const { error: acceptErr } = await sb.rpc("accept_invite", { p_token: token });
+  // If it errors because already-redeemed, we still try to read the group below.
+
+  // 3) Load the groups this guest can now see.
+  const { data: groups, error: gErr } = await sb
+    .from("groups").select("id,name,base_currency").order("created_at");
+  if (gErr) return showError("Couldn't load the group.", gErr.message);
+  if (!groups || groups.length === 0) {
+    return showError("This invite link is no longer valid.", acceptErr?.message || "It may have already been used.");
+  }
+  const group = groups[groups.length - 1]; // most recently joined
+  await render(sb, group);
+}
+
+async function render(sb, group) {
+  const ccy = group.base_currency || "SGD";
+  const [members, expenses, payers, splits] = await Promise.all([
+    sb.from("group_members").select("id,display_name,profile_id").eq("group_id", group.id),
+    sb.from("expenses").select("id,description,total_minor,currency,fx_rate_to_base,category,occurred_at").eq("group_id", group.id),
+    sb.from("expense_payers").select("expense_id,member_id,amount_minor"),
+    sb.from("expense_splits").select("expense_id,member_id,computed_minor"),
+  ]);
+  if (members.error || expenses.error) return showError("Couldn't load group details.", (members.error||expenses.error).message);
+
+  const mById = Object.fromEntries((members.data||[]).map(m => [m.id, m]));
+  const expIds = new Set((expenses.data||[]).map(e => e.id));
+  // Net balance per member (in base currency): paid - owed. computed_minor is already base.
+  const bal = {};
+  (members.data||[]).forEach(m => bal[m.id] = 0);
+  (payers.data||[]).forEach(p => { if (expIds.has(p.expense_id) && p.member_id in bal) bal[p.member_id] += Math.round(p.amount_minor * 1); });
+  (splits.data||[]).forEach(s => { if (expIds.has(s.expense_id) && s.member_id in bal) bal[s.member_id] -= s.computed_minor; });
+
+  const total = (expenses.data||[]).reduce((a,e)=> a + Math.round(e.total_minor * (e.fx_rate_to_base||1)), 0);
+
+  const memberRows = (members.data||[])
+    .sort((a,b)=> (bal[b.id]||0)-(bal[a.id]||0))
+    .map(m => {
+      const b = bal[m.id] || 0;
+      const cls = b > 0 ? "pos" : b < 0 ? "neg" : "muted";
+      const label = b > 0 ? "is owed" : b < 0 ? "owes" : "settled";
+      return `<div class="row"><div><div class="name">${esc(m.display_name)}${m.profile_id ? "" : ' <span class="pill">guest</span>'}</div>
+        <div class="sub">${label}</div></div><div class="amt ${cls}">${b===0?"—":fmt(b,ccy)}</div></div>`;
+    }).join("");
+
+  const expenseRows = (expenses.data||[])
+    .sort((a,b)=> new Date(b.occurred_at||0) - new Date(a.occurred_at||0))
+    .map(e => `<div class="row"><div><div class="name">${esc(e.description||"Expense")}</div>
+      <div class="sub">${esc(e.category||"")}</div></div>
+      <div class="amt">${fmt(Math.round(e.total_minor*(e.fx_rate_to_base||1)), ccy)}</div></div>`).join("")
+      || `<div class="muted" style="padding:8px 0">No expenses yet.</div>`;
+
+  app.innerHTML = `
+    <h1>${esc(group.name)} <span class="badge">GUEST</span></h1>
+    <div class="muted">You're viewing this group as a guest — no account needed.</div>
+    <div class="section-title">Summary</div>
+    <div class="card"><div class="row"><div class="name">Total spent</div><div class="amt">${fmt(total,ccy)}</div></div>
+      <div class="row"><div class="name">Members</div><div class="amt">${(members.data||[]).length}</div></div></div>
+    <div class="section-title">Balances</div>
+    <div class="card">${memberRows}</div>
+    <div class="section-title">Expenses</div>
+    <div class="card">${expenseRows}</div>
+    <div class="muted" style="text-align:center;margin-top:24px">Powered by SplitApp</div>`;
+}
+
+main().catch(e => showError("Something went wrong.", e?.message));
+</script>
+</body>
+</html>
